@@ -1,0 +1,116 @@
+name: Mobile Android Release APK
+
+# Standalone release APK for testing: production variant, embedded JS
+# bundle, no Metro/dev-client server required. The APK is signed with a
+# throwaway test keystore generated on the runner, so no signing secrets
+# are involved (never install this over a store build).
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "feat/mobile-i18n*"
+      - "feat/mobile-*"
+    paths:
+      - "apps/mobile/**"
+      - "packages/shared/**"
+      - "packages/shared-react/**"
+      - "packages/trpc/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/mobile-android-release.yml"
+  pull_request:
+    paths:
+      - "apps/mobile/**"
+      - "packages/shared/**"
+      - "packages/shared-react/**"
+      - "packages/trpc/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/mobile-android-release.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup
+        uses: ./tooling/github/setup
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      # GitHub-hosted runners already ship the Android SDK (platform-tools,
+      # build-tools, emulator images); the legacy android-actions/setup-android
+      # step fails requesting the removed 'tools' package.
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Expo prebuild (generate native Android project)
+        working-directory: apps/mobile
+        run: pnpm dlx expo prebuild --platform android --no-install --clean
+        env:
+          # No APP_VARIANT -> production variant ("Karakeep",
+          # app.hoarder.hoardermobile) with an embedded release bundle.
+          EXPO_NO_TELEMETRY: "1"
+          SENTRY_DISABLE_AUTO_UPLOAD: "true"
+
+      - name: Build release APK
+        working-directory: apps/mobile/android
+        run: ./gradlew assembleRelease --no-daemon --console=plain
+        env:
+          SENTRY_DISABLE_AUTO_UPLOAD: "true"
+
+      - name: Verify / sign APK
+        id: apk
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          APK="$(find apps/mobile/android/app/build/outputs -type f -name '*.apk' | head -n 1)"
+          if [ -z "$APK" ]; then
+            echo "No release APK produced" >&2
+            exit 1
+          fi
+          echo "Found APK: $APK"
+          ls -la "$APK"
+
+          # The Expo/React Native template already signs release builds with
+          # the Gradle debug keystore; only sign ourselves if it is unsigned.
+          if "$BUILD_TOOLS/apksigner" verify "$APK" > /dev/null 2>&1; then
+            echo "APK already signed, using it as-is"
+            SIGNED="$APK"
+          else
+            echo "APK is unsigned, signing with an ephemeral test keystore"
+            keytool -genkeypair -v \
+              -keystore "$RUNNER_TEMP/karakeep-test.keystore" \
+              -alias karakeep-test -keyalg RSA -keysize 2048 -validity 3650 \
+              -storepass karakeep -keypass karakeep \
+              -dname "CN=Karakeep Test, OU=Mobile, O=Karakeep, C=PL"
+            SIGNED="${APK%.apk}-test-signed.apk"
+            "$BUILD_TOOLS/apksigner" sign \
+              --ks "$RUNNER_TEMP/karakeep-test.keystore" \
+              --ks-pass pass:karakeep \
+              --key-pass pass:karakeep \
+              --out "$SIGNED" "$APK"
+            rm -f "$RUNNER_TEMP/karakeep-test.keystore"
+          fi
+
+          echo "--- signature ---"
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$SIGNED" | head -n 5
+          echo "path=$SIGNED" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: karakeep-mobile-i18n-pl-release-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
